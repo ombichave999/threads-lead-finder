@@ -1,8 +1,8 @@
-name: 24/7 Threads Lead Finder
+name: 24/7 Fast Threads Lead Finder
 
 on:
   schedule:
-    - cron: '*/30 * * * *'
+    - cron: '*/5 * * * *'
   workflow_dispatch:
 
 permissions:
@@ -26,7 +26,7 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Execute Lead Scraper
+      - name: Execute Fast Lead Scraper (Headless DOM)
         env:
           GOOGLE_SHEET_WEBHOOK: ${{ secrets.GOOGLE_SHEET_WEBHOOK }}
         run: |

@@ -5,113 +5,103 @@ import json
 import time
 import random
 import datetime
-import urllib.parse
-import urllib.request
+import subprocess
+import shutil
 
 LEADS_FILE = "leads.csv"
 LEADS_JSON = "leads.json"
 GOOGLE_SHEET_WEBHOOK = os.environ.get("GOOGLE_SHEET_WEBHOOK", "").strip()
 
-# Target high-intent queries
 SEARCH_QUERIES = [
-    'site:threads.net "looking for a website designer"',
-    'site:threads.net "looking for a web developer"',
-    'site:threads.net "need a website designer"',
-    'site:threads.net "hire a web developer"',
-    'site:threads.net "redesign our website"',
-    'site:threads.net "looking for a shopify developer"',
-    'site:threads.net "looking for a wordpress developer"',
-    'site:threads.net "need a freelancer for website"'
+    "looking for website designer",
+    "need website designer",
+    "looking for web developer",
+    "need web developer",
+    "hire a web developer",
+    "need freelance web developer",
+    "redesign our website",
+    "looking for shopify developer",
+    "looking for wordpress developer"
 ]
 
-USER_AGENTS = [
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-]
+def get_browser_bin():
+    """Finds available Chrome/Brave/Chromium executable."""
+    candidates = [
+        "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/chromium-browser",
+        "/usr/bin/chromium"
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    for b in ["google-chrome", "google-chrome-stable", "chromium", "brave-browser"]:
+        which = shutil.which(b)
+        if which:
+            return which
+    return None
 
-def get_cutoff_date():
-    """Returns midnight of yesterday as a datetime object."""
+def get_cutoff_timestamp():
+    """Returns UNIX timestamp of midnight of yesterday."""
     now = datetime.datetime.now()
     yesterday = now - datetime.timedelta(days=1)
-    return yesterday.replace(hour=0, minute=0, second=0, microsecond=0)
+    midnight_yesterday = yesterday.replace(hour=0, minute=0, second=0, microsecond=0)
+    return midnight_yesterday.timestamp()
 
-def is_recent(snippet):
-    """
-    Enforces 'yesterday to future' filter.
-    Rejects any snippet indicating older dates.
-    """
-    snippet_lower = snippet.lower()
+def extract_posts_from_dom(html):
+    scripts = re.findall(r'<script[^>]*type="application/json"[^>]*>(.*?)</script>', html)
+    posts = []
     
-    # Old years check (e.g. 2020-2025 if current is 2026)
-    current_year = datetime.datetime.now().year
-    for past_year in range(2020, current_year):
-        if str(past_year) in snippet:
-            return False
-            
-    # Obvious old indicators
-    old_patterns = [
-        r'\b\d+\s+(weeks?|months?|years?)\s+ago\b',
-        r'\b2\s+days?\s+ago\b',
-        r'\b[3-9]\s+days?\s+ago\b'
+    def search_nodes(obj):
+        if isinstance(obj, dict):
+            if "code" in obj and "caption" in obj and isinstance(obj["caption"], dict) and "user" in obj and isinstance(obj["user"], dict):
+                username = obj["user"].get("username")
+                code = obj.get("code")
+                caption_text = obj["caption"].get("text", "")
+                taken_at = obj.get("taken_at")
+                if username and code and caption_text:
+                    posts.append({
+                        "username": username,
+                        "code": code,
+                        "caption": caption_text,
+                        "taken_at": taken_at
+                    })
+            for v in obj.values():
+                search_nodes(v)
+        elif isinstance(obj, list):
+            for item in obj:
+                search_nodes(item)
+
+    for s in scripts:
+        if '"caption":' in s and '"username":' in s:
+            try:
+                data = json.loads(s)
+                search_nodes(data)
+            except:
+                pass
+    return posts
+
+def fetch_threads_posts(query, browser_bin):
+    url = f"https://www.threads.net/search?q={query.replace(' ', '+')}&serp_type=default"
+    cmd = [
+        browser_bin,
+        "--headless=new",
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--virtual-time-budget=6000",
+        "--dump-dom",
+        url
     ]
-    for p in old_patterns:
-        if re.search(p, snippet_lower):
-            return False
-
-    return True
-
-def load_existing_leads():
-    leads = []
-    seen_urls = set()
-    if os.path.exists(LEADS_FILE):
-        try:
-            with open(LEADS_FILE, "r", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    url = row.get("Post URL", "").strip()
-                    if url and url not in seen_urls:
-                        leads.append(row)
-                        seen_urls.add(url)
-        except Exception as e:
-            print(f"[!] Warning reading existing leads: {e}")
-    return leads, seen_urls
-
-def search_ddg_lite(query, time_range="d"):
-    """
-    Queries DuckDuckGo Lite with time filter.
-    df='d' (past 24h), df='w' (past week)
-    """
-    leads = []
     try:
-        url = "https://lite.duckduckgo.com/lite/"
-        data = urllib.parse.urlencode({"q": query, "df": time_range}).encode("utf-8")
-        req = urllib.request.Request(
-            url,
-            data=data,
-            headers={
-                "User-Agent": random.choice(USER_AGENTS),
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-            }
-        )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            html = resp.read().decode("utf-8", errors="ignore")
-            matches = re.findall(r'<a[^>]+href="(https://(?:www\.)?threads\.net/@[^/]+/post/[^"?#]+)"[^>]*>(.*?)</a>', html)
-            for link, snippet_html in matches:
-                clean_snippet = re.sub(r'<[^>]+>', '', snippet_html).strip()
-                if not is_recent(clean_snippet):
-                    continue
-                author_match = re.search(r'threads\.net/@([^/]+)', link)
-                author = f"@{author_match.group(1)}" if author_match else "Unknown"
-                leads.append({
-                    "url": link,
-                    "author": author,
-                    "snippet": clean_snippet or "Looking for web developer/designer"
-                })
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=25, text=True, errors="ignore")
+        if proc.stdout:
+            return extract_posts_from_dom(proc.stdout)
     except Exception as e:
-        print(f"[!] Search error for '{query}': {e}")
-    return leads
+        print(f"[!] Browser fetch error for '{query}': {e}")
+    return []
 
 def detect_platform(text):
     text_lower = text.lower()
@@ -125,10 +115,34 @@ def detect_platform(text):
         return "React / Next.js"
     return "Website / Custom"
 
+def extract_budget(text):
+    match = re.search(r'(\$\d+[\d,]*|\b\d+\s*(?:k|usd|eur|inr|gbp)\b|budget[^\n,.]+)', text, re.IGNORECASE)
+    if match:
+        return match.group(0).strip()
+    return "Negotiable / Discuss"
+
+def load_existing_leads():
+    leads = []
+    seen_codes = set()
+    if os.path.exists(LEADS_FILE):
+        try:
+            with open(LEADS_FILE, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    url = row.get("Post URL", "")
+                    code_match = re.search(r'/post/([A-Za-z0-9_-]+)', url)
+                    if code_match:
+                        seen_codes.add(code_match.group(1))
+                    leads.append(row)
+        except Exception as e:
+            print(f"[!] Warning reading existing leads: {e}")
+    return leads, seen_codes
+
 def push_to_google_sheet(lead):
     if not GOOGLE_SHEET_WEBHOOK:
         return False
     try:
+        import urllib.request
         payload = json.dumps(lead).encode("utf-8")
         req = urllib.request.Request(
             GOOGLE_SHEET_WEBHOOK,
@@ -142,50 +156,69 @@ def push_to_google_sheet(lead):
         return False
 
 def main():
-    now = datetime.datetime.now()
-    now_str = now.strftime("%Y-%m-%d %H:%M")
-    cutoff = get_cutoff_date()
-    print(f"[{now.isoformat()}] Starting Fresh Lead Finder (Filter: >= {cutoff.strftime('%Y-%m-%d')})...")
-    
-    all_leads, seen_urls = load_existing_leads()
-    print(f"[*] Loaded {len(all_leads)} existing leads.")
+    browser_bin = get_browser_bin()
+    if not browser_bin:
+        print("[!] Error: No Chrome/Brave/Chromium browser found on system.")
+        return
+
+    cutoff_ts = get_cutoff_timestamp()
+    cutoff_dt = datetime.datetime.fromtimestamp(cutoff_ts)
+    print(f"[{datetime.datetime.now().isoformat()}] Starting Fast Lead Finder (Cutoff: >= {cutoff_dt.strftime('%Y-%m-%d')})...")
+    print(f"[*] Using browser binary: {browser_bin}")
+
+    all_leads, seen_codes = load_existing_leads()
+    print(f"[*] Loaded {len(all_leads)} existing leads in ledger.")
 
     new_count = 0
 
-    # Search past day (df='d') first, then past week (df='w')
-    for time_filter in ["d", "w"]:
-        for query in SEARCH_QUERIES:
-            print(f"[*] Searching ({time_filter}): {query}")
-            results = search_ddg_lite(query, time_range=time_filter)
-            for res in results:
-                url = res["url"]
-                if url in seen_urls:
-                    continue
-                
-                new_lead = {
-                    "Date found": now_str,
-                    "Posted date": "Yesterday - Today",
-                    "Platform/source": detect_platform(res["snippet"]),
-                    "Author/handle": res["author"],
-                    "What they need": res["snippet"][:150],
-                    "Post URL": url,
-                    "Public contact": "Public Threads Post",
-                    "Budget": "Discuss / Inquire",
-                    "Location": "Remote",
-                    "Deadline": "ASAP",
-                    "Notes": "Fresh Lead (Filtered from yesterday onwards)"
-                }
-                all_leads.append(new_lead)
-                seen_urls.add(url)
-                new_count += 1
-                
-                if GOOGLE_SHEET_WEBHOOK:
-                    push_to_google_sheet(new_lead)
-            
-            time.sleep(random.uniform(1.5, 3.0))
+    for query in SEARCH_QUERIES:
+        print(f"[*] Scanning Threads: '{query}'")
+        raw_posts = fetch_threads_posts(query, browser_bin)
+        
+        for p in raw_posts:
+            code = p.get("code")
+            if not code or code in seen_codes:
+                continue
 
-    # SORT: Newest found date first
-    all_leads.sort(key=lambda x: x.get("Date found", ""), reverse=True)
+            taken_at = p.get("taken_at")
+            if taken_at and taken_at < cutoff_ts:
+                # Exclude leads older than yesterday
+                continue
+
+            posted_date_str = (
+                datetime.datetime.fromtimestamp(taken_at).strftime("%Y-%m-%d")
+                if taken_at else datetime.datetime.now().strftime("%Y-%m-%d")
+            )
+
+            caption = p.get("caption", "").strip()
+            username = p.get("username", "unknown")
+            post_url = f"https://www.threads.net/@{username}/post/{code}"
+
+            lead = {
+                "Date found": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "Posted date": posted_date_str,
+                "Platform/source": detect_platform(caption),
+                "Author/handle": f"@{username}",
+                "What they need": caption.replace("\n", " ")[:160],
+                "Post URL": post_url,
+                "Public contact": "Threads DM",
+                "Budget": extract_budget(caption),
+                "Location": "Remote",
+                "Deadline": "Immediate / ASAP",
+                "Notes": "Fresh Lead (Yesterday to Future)"
+            }
+
+            all_leads.append(lead)
+            seen_codes.add(code)
+            new_count += 1
+
+            if GOOGLE_SHEET_WEBHOOK:
+                push_to_google_sheet(lead)
+
+        time.sleep(random.uniform(1.0, 2.0))
+
+    # Sort strictly newest first
+    all_leads.sort(key=lambda x: (x.get("Posted date", ""), x.get("Date found", "")), reverse=True)
 
     fieldnames = [
         "Date found", "Posted date", "Platform/source", "Author/handle",
@@ -193,18 +226,16 @@ def main():
         "Location", "Deadline", "Notes"
     ]
 
-    # Save sorted leads to CSV
     with open(LEADS_FILE, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         for l in all_leads:
             writer.writerow(l)
 
-    # Also save sorted leads to JSON for easy dashboard consumption
     with open(LEADS_JSON, "w", encoding="utf-8") as f:
         json.dump(all_leads, f, indent=2)
 
-    print(f"[✓] Complete! {new_count} new fresh leads added. Total leads in ledger: {len(all_leads)} (Sorted newest first).")
+    print(f"[✓] Complete! {new_count} fresh leads added. Total leads in ledger: {len(all_leads)}.")
 
 if __name__ == "__main__":
     main()
