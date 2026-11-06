@@ -191,6 +191,18 @@ def main():
             )
 
             caption = p.get("caption", "").strip()
+            caption_lower = caption.lower()
+            
+            # Rule 6 Filter: Ignore competitors, job seekers, pure mobile apps, and spam
+            if any(k in caption_lower for k in [
+                'am a web developer', 'i am a developer', 'web developer from',
+                'looking for work:', 'hire me', 'open to work', 'beauty contest',
+                'graphic designer', 'create content for instagram', 'dr cardin is hiring'
+            ]):
+                continue
+            if 'mobile app' in caption_lower and 'website' not in caption_lower and 'web' not in caption_lower:
+                continue
+
             username = p.get("username", "unknown")
             post_url = f"https://www.threads.net/@{username}/post/{code}"
 
